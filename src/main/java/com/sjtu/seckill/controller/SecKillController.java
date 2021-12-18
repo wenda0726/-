@@ -65,32 +65,35 @@ public class SecKillController implements InitializingBean { //在初始化时�
     //利用内存，在商品库存已经为空时，减少对redis的访问
     Map<Long,Boolean> isEmpty = new HashMap<>();
 
-    @RequestMapping("/doSeckill2")
-    public String doSecKill2(Model model, User user, Long goodsId){
+    @RequestMapping(value = "/doSeckill2",method = RequestMethod.POST)
+    @ResponseBody
+    public RespBean doSecKill2(User user, Long goodsId){
         if(user == null){
-            return "login";
+            return RespBean.error(RespBeanEnum.SESSION_ERROR);
         }
         GoodsVO goods = goodsService.findGoodsByGoodsId(goodsId);
-        if(goods.getStockCount() < 1){
-            model.addAttribute("errorMsg", RespBeanEnum.EMPTY_STOCK.getMessage());
-            return "secKillFail";
+        //如果库存已经为空，则直接返回，减少对redis的访问
+        if(isEmpty.get(goodsId)){
+            return RespBean.error(RespBeanEnum.EMPTY_STOCK);
         }
-        //判断该用户是否已经购买过当前商品
-        SeckillOrder seckillOrder = seckillOrderService.getOne(
-                new QueryWrapper<SeckillOrder>()
-                        .eq("user_id", user.getId())
-                        .eq("goods_id", goodsId));
-
-        if(seckillOrder != null){
-            model.addAttribute("errorMsg",RespBeanEnum.REPEAT_BUY.getMessage());
-            return "secKillFail";
+        //通过redis查询用户是否重复购买
+        SeckillOrder order = (SeckillOrder) redisTemplate.opsForValue().get("order:" + user.getId() + ":" + goods.getId());
+        if(order != null){
+            return RespBean.error(RespBeanEnum.REPEAT_BUY);
         }
-        //可以下单购买
-        Order order = orderService.seckill(user,goods);
-        model.addAttribute("goods",goods);
-        model.addAttribute("order",order);
+        Long stock = (Long) redisTemplate.execute(script, Collections.singletonList("secKillGoods:" + goodsId), Collections.EMPTY_LIST);
+        if(stock < 0){
+            isEmpty.put(goodsId,true);
+            //全部买完后，库存会减为-1，恢复redis中库存为0
+            redisTemplate.opsForValue().increment("secKillGoods:" + goodsId);
+            return RespBean.error(RespBeanEnum.EMPTY_STOCK);
+        }
+        orderService.seckill(user,goods);
+        SeckillMessage seckillMessage = new SeckillMessage(goodsId,user);
+        String message = JsonUtil.objectToJson(seckillMessage);
+        mqSender.send(message);
 
-        return "orderDetail";
+        return RespBean.success(0);
     }
 
 
@@ -114,7 +117,7 @@ public class SecKillController implements InitializingBean { //在初始化时�
         if (seckillOrder != null) {
             return RespBean.error(RespBeanEnum.REPEAT_BUY);
         }
-        //利用redis进行库存预先扣减的时候没有原子行，实现redis分布式锁
+        //利用redis进行库存预先扣减的时候没有原子性，实现redis分布式锁
         Long stock = (Long) redisTemplate.execute(script, Collections.singletonList("secKillGoods:" + goodsId), Collections.EMPTY_LIST);
 
 //        Long stock = redisTemplate.opsForValue().decrement("secKillGoods:" + goodsId);
